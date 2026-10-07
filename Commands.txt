@@ -1,0 +1,19 @@
+Commands
+
+cd /vimal/rag_chatbot
+docker compose up -d
+docker start
+
+
+start the celery
+
+cd C:\Vimal\rag_chatbot
+.venv\Scripts\Activate.ps1
+celery -A celery_app worker --loglevel=info --pool=solo
+
+audit log
+Get-Content .\data\audit\guardrails.jsonl -Wait
+
+
+# create users
+ python -m security.create_user

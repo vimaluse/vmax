@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local AI Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ================= LOGIN SCREEN ================= -->
+<div id="loginScreen" style="display:flex;">
+    <form id="loginForm" class="login-card" autocomplete="on">
+
+        <div class="login-logo">AI</div>
+        <h2>Welcome back</h2>
+        <p class="login-sub">Sign in to continue to your AI Assistant</p>
+
+        <label for="loginUsername">User ID</label>
+        <input id="loginUsername" type="text" placeholder="Enter your User ID"
+               autocomplete="username" required>
+
+        <label for="loginPassword">Password</label>
+        <div class="pw-wrap">
+            <input id="loginPassword" type="password" placeholder="Enter your password"
+                   autocomplete="current-password" required>
+            <button type="button" class="pw-toggle" id="pwToggle"
+                    aria-label="Show password">Show</button>
+        </div>
+
+        <button id="loginButton" type="submit">Sign in</button>
+
+        <div id="loginError" class="login-error"></div>
+
+        <div class="login-foot">Secured access &middot; Local AI</div>
+    </form>
+</div>
+
+<!-- ================= CHAT APPLICATION ================= -->
+<div class="app" id="chatApp" style="display:none;">
+
+    <aside class="sidebar">
+        <button class="new-chat" id="newChat" type="button">+ New chat</button>
+
+        <div class="side-title">LOCAL AI</div>
+        <div class="side-info">
+            Gemma 4<br>
+            RAG + ChromaDB<br>
+            Whisper STT<br>
+            Tesseract OCR
+        </div>
+
+        <div class="user-box">
+            <span id="currentUser"></span>
+            <button id="logoutButton" type="button">Logout</button>
+        </div>
+
+        <div class="health" id="health">● checking...</div>
+    </aside>
+
+    <main class="main">
+        <div class="topbar">
+            <strong>AI Assistant</strong>
+            <span>gemma4:latest</span>
+        </div>
+
+        <div class="chat" id="chat">
+            <div class="welcome" id="welcome">
+                <h1>How can I help you?</h1>
+                <p>Upload a document, image or audio file, or ask a question.</p>
+            </div>
+        </div>
+
+        <div class="composer-wrap">
+            <div class="attachments" id="attachments"></div>
+
+            <div class="composer">
+                <input id="fileInput" type="file" multiple hidden>
+
+                <button class="icon-btn" id="attachBtn" type="button" title="Upload file">+</button>
+
+                <textarea id="message" rows="1" placeholder="Message AI Assistant..."></textarea>
+
+                <button class="icon-btn mic" id="micBtn" type="button" title="Voice input">🎤</button>
+
+                <button class="send" id="sendBtn" type="button" title="Send">↑</button>
+            </div>
+
+            <div class="hint">Enter to send · Shift+Enter for newline · + to upload</div>
+        </div>
+    </main>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+    (function () {
+        var t = document.getElementById("pwToggle");
+        var p = document.getElementById("loginPassword");
+        if (!t || !p) return;
+        t.addEventListener("click", function () {
+            var show = p.type === "password";
+            p.type = show ? "text" : "password";
+            t.textContent = show ? "Hide" : "Show";
+        });
+    })();
+</script>
+</body>
+</html>

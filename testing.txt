@@ -1,0 +1,10 @@
+Our company was founded in 2020.
+The company headquarters is in Chennai.
+The company has 50 employees.
+
+
+Employee Name: Vimal
+Email: vimal@example.com
+PAN: ABCDE1234F
+Salary: ₹75,000
+Aadhaar: 1234 5678 9012
