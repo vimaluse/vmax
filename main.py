@@ -227,7 +227,7 @@ def is_weather_question(query: str) -> bool:
         for keyword in weather_keywords
     )
 
-def extract_weather_city(query: str) -> str:
+def extract_weather_cities(query: str) -> str:
     query_lower = query.lower()
 
     patterns = [
@@ -237,6 +237,8 @@ def extract_weather_city(query: str) -> str:
         "weather at ",
         "temperature at ",
         "forecast at ",
+        "what is weather in",
+        "How is weather in",
     ]
 
     for pattern in patterns:
@@ -605,14 +607,6 @@ MODERATION_CONFIG = ModerationConfig()
 MODERATION_DETECTOR = ModerationDetector(
     MODERATION_CONFIG
 )
-
-
-# ============================================================
-# AUDIT HELPER
-# ============================================================
-
-
-
 
 # ============================================================
 # REQUEST MODELS
@@ -1957,37 +1951,6 @@ def is_weather_question(query: str) -> bool:
         for keyword in weather_keywords
     )
 
-def extract_weather_city(query: str) -> str:
-
-    query_lower = query.lower()
-
-    patterns = [
-        "weather in ",
-        "temperature in ",
-        "forecast in ",
-        "weather at ",
-        "temperature at ",
-        "forecast at ",
-    ]
-
-    for pattern in patterns:
-
-        if pattern in query_lower:
-
-            index = query_lower.find(
-                pattern
-            )
-
-            city = query[
-                index + len(pattern):
-            ]
-
-            return city.strip(
-                " ?.,"
-            )
-
-    return ""
-
 async def call_mcp_weather(
     city: str
 ) -> str:
@@ -2040,6 +2003,34 @@ async def call_mcp_weather(
         )
 
         raise
+
+
+async def get_mcp_weather_for_cities(
+    cities: str
+) -> str:
+
+    if not cities:
+        return "Please provide a city for the weather request."
+
+    city_list = [
+        city.strip()
+        for city in re.split(
+            r"\s*(?:,|\band\b)\s*",
+            cities,
+            flags=re.IGNORECASE,
+        )
+        if city.strip()
+    ]
+
+    results = []
+
+    for city in city_list:
+        results.append(
+            await call_mcp_weather(city)
+        )
+
+    return "\n\n".join(results)
+
 
 # ============================================================
 # CHAT
