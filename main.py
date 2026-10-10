@@ -6,6 +6,8 @@ import re
 import tempfile
 import time
 import uuid
+import redis
+from qdrant_client import QdrantClient
 
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,34 @@ import httpx
 import uvicorn
 
 from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
+from prometheus_client import Gauge
+user_last_activity = Gauge(
+    "chatbot_user_last_activity_timestamp",
+    "Unix timestamp of the user's last activity",
+    ["user"]
+)
+
+import time
+
+
+CHAT_REQUESTS = Counter(
+    "chat_requests_total",
+    "Total number of chat requests"
+)
+
+CHAT_ERRORS = Counter(
+    "chat_errors_total",
+    "Total number of chat errors"
+)
+
+CHAT_RESPONSE_TIME = Histogram(
+    "chat_response_time_seconds",
+    "Chatbot response time in seconds",
+    buckets=(0.5, 1, 2, 3, 5, 10, 15, 30, 60)
+)
+import time
 
 from starlette.background import BackgroundTask
 from dotenv import load_dotenv
@@ -1078,20 +1108,65 @@ def authorize_model_request(
 # HEALTH
 # ============================================================
 
-@app.get(
-    "/api/health"
-)
+
+@app.get("/api/health")
 async def health():
+    services = {}
+
+    # Check Redis
+    try:
+        redis_client = redis.Redis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            socket_connect_timeout=3,
+            socket_timeout=3,
+        )
+        services["redis"] = (
+            "connected" if redis_client.ping() else "disconnected"
+        )
+        redis_client.close()
+    except Exception:
+        services["redis"] = "disconnected"
+
+    # Check Qdrant
+    try:
+        qdrant_client = QdrantClient(
+            url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+            timeout=3,
+        )
+        qdrant_client.get_collections()
+        services["qdrant"] = "connected"
+        qdrant_client.close()
+    except Exception:
+        services["qdrant"] = "disconnected"
+
+    # Check Ollama
+    try:
+        response = httpx.get(
+            f"{OLLAMA_URL.rstrip('/')}/api/tags",
+            timeout=5,
+        )
+        response.raise_for_status()
+        services["ollama"] = "connected"
+    except Exception:
+        services["ollama"] = "disconnected"
+
+    all_connected = all(
+        status == "connected"
+        for status in services.values()
+    )
+
+    status = "ok" if all_connected else "degraded"
 
     safe_audit(
         "health_check",
-        status="ok",
+        status=status,
         ollama_model=OLLAMA_MODEL,
         moderation_enabled=MODERATION_CONFIG.enabled,
     )
 
     return {
-        "status": "ok",
+        "status": status,
+        "services": services,
         "ollama_url": OLLAMA_URL,
         "ollama_model": OLLAMA_MODEL,
         "moderation_enabled": MODERATION_CONFIG.enabled,
@@ -1100,6 +1175,7 @@ async def health():
             "true",
         ).lower() == "true",
     }
+
 
 
 # ============================================================
@@ -2047,6 +2123,14 @@ async def chat(
     ),
 ):
 
+    # ========================================================
+    # PROMETHEUS - USER LAST ACTIVITY
+    # ========================================================
+
+    user_last_activity.labels(
+        user=current_user.username
+    ).set(time.time())
+
     request_id = str(
         uuid.uuid4()
     )
@@ -2054,6 +2138,9 @@ async def chat(
     query = request.message.strip()
 
     chat_started = time.perf_counter()
+
+    #prometheus
+    CHAT_REQUESTS.inc()
 
     user = current_user
 
@@ -2092,6 +2179,7 @@ async def chat(
         )
 
     except Exception as exc:
+        CHAT_ERRORS.inc()
 
         safe_audit(
             "rate_limit_error",
@@ -2226,6 +2314,7 @@ async def chat(
         )
 
     except Exception as exc:
+        CHAT_ERRORS.inc()
 
         safe_audit(
             "chat_input_guard_error",
@@ -2315,6 +2404,7 @@ async def chat(
                 }
 
             except Exception as exc:
+                CHAT_ERRORS.inc()
 
                 print(
                     f"[MCP] Weather request failed: {exc}"
@@ -2373,6 +2463,7 @@ async def chat(
             }
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             print(
                 f"[MCP Weather] Failed: {exc}"
@@ -2422,6 +2513,7 @@ async def chat(
         )
 
     except Exception as exc:
+        CHAT_ERRORS.inc()
 
         print(
             f"[RAG] Retrieval failed: {exc}"
@@ -2556,6 +2648,7 @@ async def chat(
             )
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             print(
                 f"[RAG] Document guard error: {exc}"
@@ -2725,6 +2818,7 @@ async def chat(
                 )
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             print(
                 f"[Web Search] Failed: {exc}"
@@ -3335,6 +3429,7 @@ Answer clearly, directly, and concisely.
             )
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             safe_audit(
                 "chat_history_guard_error",
@@ -3427,6 +3522,7 @@ Answer clearly, directly, and concisely.
                     )
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             safe_audit(
                 "image_attachment_error",
@@ -3464,6 +3560,7 @@ Answer clearly, directly, and concisely.
                 )
 
             except Exception as exc:
+                CHAT_ERRORS.inc()
 
                 safe_audit(
                     "image_encoding_error",
@@ -3550,6 +3647,7 @@ Answer clearly, directly, and concisely.
         )
 
     except Exception as exc:
+        CHAT_ERRORS.inc()
 
         safe_audit(
             "ollama_error",
@@ -3596,6 +3694,7 @@ Answer clearly, directly, and concisely.
             )
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             print(
                 f"[Hallucination] Check failed: {exc}"
@@ -3683,6 +3782,7 @@ Answer clearly, directly, and concisely.
         )
 
     except Exception as exc:
+        CHAT_ERRORS.inc()
 
         safe_audit(
             "chat_output_guard_error",
@@ -3782,6 +3882,11 @@ Answer clearly, directly, and concisely.
             ) * 1000,
             2,
         ),
+    )
+
+    # Prometheus response-time metric
+    CHAT_RESPONSE_TIME.observe(
+        time.perf_counter() - chat_started
     )
 
     # ========================================================
@@ -4490,6 +4595,13 @@ async def serve_frontend():
 
     return FileResponse(
         STATIC_DIR / "index.html"
+    )
+
+@app.get("/metrics")
+async def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
     )
 
 

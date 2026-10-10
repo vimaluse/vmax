@@ -1,0 +1,15 @@
+groups:
+  - name: chatbot-user-alerts
+    rules:
+
+      - alert: UserInactiveFor5Minutes
+        expr: |
+          (time() - chatbot_user_last_activity_timestamp) > 10
+        for: 10s
+
+        labels:
+          severity: warning
+
+        annotations:
+          summary: "User inactive for more than 5 minutes"
+          description: 'User {{ $labels.user }} has not made any request for more than 5 minutes.'
