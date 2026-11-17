@@ -18,6 +18,7 @@ class SecurityDecision:
 def authorize_chat(
     user,
     model_name: str = DEFAULT_MODEL,
+
 ) -> SecurityDecision:
 
     reasons = []

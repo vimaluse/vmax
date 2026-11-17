@@ -1,0 +1,19 @@
+# LiteLLM gateway configuration for Qwen via Ollama and Gemini 3.6 Flash.
+model_list:
+  - model_name: qwen-ollama
+    litellm_params:
+      model: ollama_chat/qwen3.5:9b
+      api_base: http://host.docker.internal:11434
+
+  - model_name: gemini-3.6-flash
+    litellm_params:
+      model: gemini/gemini-3.6-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+litellm_settings:
+  num_retries: 1
+  request_timeout: 300
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL

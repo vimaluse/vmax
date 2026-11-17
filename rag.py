@@ -601,6 +601,11 @@ def index_file(
             )
         )
 
+        
+# Debug logs - keep outside the payload dictionary
+        print("[UPLOAD] User ID:", user_id)
+        print("[UPLOAD] File path:", path)
+
         points.append(
             PointStruct(
                 id=point_id,
@@ -609,25 +614,19 @@ def index_file(
                     "text": chunk,
                     "file_id": file_id,
                     "filename": path.name,
-                    "path": str(
-                        path.resolve()
-                    ),
+                    "path": str(path.resolve()),
                     "chunk_index": i,
                     "type": path.suffix.lower(),
                     "ocr": bool(
-                        result.get(
-                            "ocr",
-                            False,
-                        )
+                        result.get("ocr", False)
                     ),
 
-                    # IMPORTANT:
-                    # This must contain the authenticated
-                    # user's ID when indexing.
+                    # Authenticated user's ID
                     "owner_user_id": user_id,
                 },
             )
         )
+
 
     # --------------------------------------------------------
     # Store vectors in Qdrant
