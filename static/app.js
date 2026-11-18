@@ -1,3 +1,4 @@
+
 /* ========================================================
    ELEMENTS
 ======================================================== */
@@ -11,6 +12,7 @@ const mic = document.getElementById("micBtn");
 const chips = document.getElementById("attachments");
 const health = document.getElementById("health");
 const newChat = document.getElementById("newChat");
+const modelSelect = document.getElementById("modelSelect");
 
 const loginScreen = document.getElementById("loginScreen");
 const chatApp = document.getElementById("chatApp");
@@ -26,6 +28,9 @@ let history = [];
 let attachments = [];
 let recorder = null;
 let chunks = [];
+
+let refreshPromise = null;
+let isLoggingOut = false;
 
 const WELCOME_HTML = `
     <div class="welcome" id="welcome">
@@ -64,33 +69,155 @@ function clearAuth() {
 
     history = [];
     attachments = [];
+
     render();
 
-    if (chatEl) chatEl.innerHTML = WELCOME_HTML;
+    if (chatEl) {
+        chatEl.innerHTML = WELCOME_HTML;
+    }
 }
 
 function authHeaders(extra = {}) {
-    return {
-        ...extra,
-        "Authorization": `Bearer ${getToken()}`
-    };
-}
+    const headers = { ...extra };
+    const token = getToken();
 
-/* Wrapper for every protected API request. */
-async function authenticatedFetch(url, options = {}) {
-    if (!getToken()) {
-        clearAuth();
-        throw new Error("Authentication required. Please login again.");
+    if (token) {
+        headers.Authorization = `Bearer ${token}`;
     }
 
-    const response = await fetch(url, {
-        ...options,
-        headers: authHeaders(options.headers || {})
-    });
+    return headers;
+}
 
+/* ========================================================
+   AUTOMATIC TOKEN REFRESH
+
+   Requires backend:
+   POST /api/auth/refresh
+
+   Backend must:
+   1. Read HttpOnly refresh-token cookie.
+   2. Validate the refresh token.
+   3. Return a new access_token.
+   4. Rotate the refresh token when appropriate.
+======================================================== */
+
+async function refreshAccessToken() {
+
+    // Prevent multiple simultaneous refresh requests.
+    if (refreshPromise) {
+        return refreshPromise;
+    }
+
+    refreshPromise = (async () => {
+
+        try {
+
+            const response = await fetch("/api/auth/refresh", {
+                method: "POST",
+                credentials: "same-origin",
+                headers: {
+                    "Content-Type": "application/json"
+                }
+            });
+
+            if (!response.ok) {
+                return false;
+            }
+
+            const data = await response.json();
+
+            if (!data.access_token) {
+                return false;
+            }
+
+            localStorage.setItem(
+                "access_token",
+                data.access_token
+            );
+
+            console.log("Access token refreshed successfully.");
+
+            return true;
+
+        } catch (error) {
+
+            console.error("Token refresh failed:", error);
+
+            return false;
+
+        } finally {
+
+            refreshPromise = null;
+
+        }
+
+    })();
+
+    return refreshPromise;
+}
+
+/* ========================================================
+   AUTHENTICATED API REQUEST
+
+   Automatically refreshes expired access tokens
+   and retries the original request once.
+======================================================== */
+
+async function authenticatedFetch(url, options = {}) {
+
+    if (isLoggingOut) {
+        throw new Error("You have been logged out.");
+    }
+
+    if (!getToken()) {
+
+        const refreshed = await refreshAccessToken();
+
+        if (!refreshed) {
+            clearAuth();
+            throw new Error("Session expired. Please login again.");
+        }
+    }
+
+    const makeRequest = () => {
+
+        const headers = authHeaders(options.headers || {});
+
+        return fetch(url, {
+            ...options,
+            headers,
+            credentials: "same-origin"
+        });
+
+    };
+
+    let response = await makeRequest();
+
+    // First 401: attempt automatic refresh.
     if (response.status === 401) {
-        clearAuth();
-        throw new Error("Session expired. Please login again.");
+
+        const refreshed = await refreshAccessToken();
+
+        if (!refreshed) {
+
+            clearAuth();
+
+            throw new Error(
+                "Your session has expired. Please login again."
+            );
+        }
+
+        // Retry original request only once.
+        response = await makeRequest();
+
+        if (response.status === 401) {
+
+            clearAuth();
+
+            throw new Error(
+                "Authentication failed after token renewal. Please login again."
+            );
+        }
     }
 
     return response;
@@ -101,10 +228,17 @@ async function authenticatedFetch(url, options = {}) {
 ======================================================== */
 
 async function login(username, password) {
+
     const response = await fetch("/api/auth/login", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: username, password: password })
+        credentials: "same-origin",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            username,
+            password
+        })
     });
 
     let data = {};
@@ -116,77 +250,128 @@ async function login(username, password) {
     }
 
     if (!response.ok) {
-        throw new Error(data.detail || "Invalid User ID or password.");
+        throw new Error(
+            data.detail || "Invalid User ID or password."
+        );
     }
 
     if (!data.access_token) {
-        throw new Error("Login succeeded but no access token was returned.");
+        throw new Error(
+            "Login succeeded but no access token was returned."
+        );
     }
 
-    localStorage.setItem("access_token", data.access_token);
+    localStorage.setItem(
+        "access_token",
+        data.access_token
+    );
 
     return data;
 }
 
+/* ========================================================
+   LOAD CURRENT USER
+======================================================== */
+
 async function loadCurrentUser() {
-    if (!getToken()) {
-        return false;
-    }
 
     try {
-        const response = await fetch("/api/auth/me", {
-            method: "GET",
-            headers: authHeaders()
-        });
+
+        // If access token is missing, try refreshing first.
+        if (!getToken()) {
+
+            const refreshed = await refreshAccessToken();
+
+            if (!refreshed) {
+                return false;
+            }
+        }
+
+        const response = await authenticatedFetch(
+            "/api/auth/me",
+            {
+                method: "GET"
+            }
+        );
 
         if (!response.ok) {
-            clearAuth();
             return false;
         }
 
         const user = await response.json();
 
-        localStorage.setItem("user", JSON.stringify(user));
+        localStorage.setItem(
+            "user",
+            JSON.stringify(user)
+        );
 
         if (currentUser) {
-            currentUser.textContent = `${user.username} (${user.role})`;
+            currentUser.textContent =
+                `${user.username} (${user.role})`;
         }
 
         showChat();
 
+        await loadAvailableModels();
+
         return true;
 
     } catch (error) {
-        console.error("Authentication check failed:", error);
-        clearAuth();
+
+        console.error(
+            "Authentication check failed:",
+            error
+        );
+
         return false;
     }
 }
 
+/* ========================================================
+   LOGIN FORM EVENT
+======================================================== */
+
 if (loginForm) {
+
     loginForm.addEventListener("submit", async (event) => {
+
         event.preventDefault();
 
-        if (loginError) loginError.textContent = "";
+        if (loginError) {
+            loginError.textContent = "";
+        }
 
-        const username = loginUsername ? loginUsername.value.trim() : "";
-        const password = loginPassword ? loginPassword.value : "";
+        const username = loginUsername
+            ? loginUsername.value.trim()
+            : "";
+
+        const password = loginPassword
+            ? loginPassword.value
+            : "";
 
         if (!username || !password) {
+
             if (loginError) {
-                loginError.textContent = "User ID and password are required.";
+                loginError.textContent =
+                    "User ID and password are required.";
             }
+
             return;
         }
 
-        const originalLabel = loginButton ? loginButton.textContent : "";
+        const originalLabel = loginButton
+            ? loginButton.textContent
+            : "";
 
         if (loginButton) {
             loginButton.disabled = true;
             loginButton.textContent = "Signing in...";
         }
 
+        isLoggingOut = false;
+
         try {
+
             await login(username, password);
 
             const authenticated = await loadCurrentUser();
@@ -195,21 +380,26 @@ if (loginForm) {
                 throw new Error("Authentication failed.");
             }
 
-            if (loginPassword) loginPassword.value = "";
+            if (loginPassword) {
+                loginPassword.value = "";
+            }
 
             check();
 
         } catch (error) {
+
             console.error("Login error:", error);
 
             localStorage.removeItem("access_token");
             localStorage.removeItem("user");
 
             if (loginError) {
-                loginError.textContent = error.message || "Login failed.";
+                loginError.textContent =
+                    error.message || "Login failed.";
             }
 
         } finally {
+
             if (loginButton) {
                 loginButton.disabled = false;
                 loginButton.textContent = originalLabel;
@@ -218,30 +408,75 @@ if (loginForm) {
     });
 }
 
+/* ========================================================
+   LOGOUT
+======================================================== */
+
 if (logoutButton) {
-    logoutButton.addEventListener("click", () => {
-        clearAuth();
-        if (loginUsername) loginUsername.focus();
+
+    logoutButton.addEventListener("click", async () => {
+
+        isLoggingOut = true;
+
+        try {
+
+            // Optional backend logout endpoint.
+            // It should revoke the refresh token and clear its cookie.
+
+            await fetch("/api/auth/logout", {
+                method: "POST",
+                credentials: "same-origin"
+            });
+
+        } catch (error) {
+
+            console.error("Logout request failed:", error);
+
+        } finally {
+
+            clearAuth();
+
+            if (loginUsername) {
+                loginUsername.focus();
+            }
+
+            isLoggingOut = false;
+        }
     });
 }
 
-/* Runs once when the page opens: login first, chat only if token is valid. */
+/* ========================================================
+   INITIALIZE AUTHENTICATION
+======================================================== */
+
 (async function initializeAuthentication() {
+
     if (!loginScreen || !chatApp) {
+
         console.error(
-            "index.html is missing #loginScreen or #chatApp - " +
-            "the login page cannot be shown."
+            "index.html is missing #loginScreen or #chatApp."
         );
     }
+
+    showLogin();
 
     const authenticated = await loadCurrentUser();
 
     if (!authenticated) {
+
+        clearAuth();
+
         showLogin();
-        if (loginUsername) loginUsername.focus();
+
+        if (loginUsername) {
+            loginUsername.focus();
+        }
+
     } else {
+
         check();
     }
+
 })();
 
 /* ========================================================
@@ -257,25 +492,46 @@ const HTML_ESCAPES = {
 };
 
 function esc(s) {
-    return String(s).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
+
+    return String(s).replace(
+        /[&<>"']/g,
+        (c) => HTML_ESCAPES[c]
+    );
 }
 
 function md(s) {
+
     s = esc(s);
 
-    /* Pull code blocks out first so their line breaks are kept as-is. */
     const blocks = [];
 
     s = s.replace(/```([\s\S]*?)```/g, (_, code) => {
-        blocks.push("<pre><code>" + code.replace(/^\n/, "") + "</code></pre>");
+
+        blocks.push(
+            "<pre><code>" +
+            code.replace(/^\n/, "") +
+            "</code></pre>"
+        );
+
         return "\u0000" + (blocks.length - 1) + "\u0000";
     });
 
-    s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
-    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(
+        /`([^`\n]+)`/g,
+        "<code>$1</code>"
+    );
+
+    s = s.replace(
+        /\*\*([^*]+)\*\*/g,
+        "<strong>$1</strong>"
+    );
+
     s = s.replace(/\n/g, "<br>");
 
-    s = s.replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[Number(i)]);
+    s = s.replace(
+        /\u0000(\d+)\u0000/g,
+        (_, i) => blocks[Number(i)]
+    );
 
     return s;
 }
@@ -285,14 +541,17 @@ function md(s) {
 ======================================================== */
 
 function add(role, text, sources = []) {
+
     document.getElementById("welcome")?.remove();
 
     const d = document.createElement("div");
+
     d.className = "msg " + role;
 
     let ttsButton = "";
 
     if (role === "assistant") {
+
         ttsButton = `
             <button
                 class="tts-button"
@@ -305,24 +564,32 @@ function add(role, text, sources = []) {
     }
 
     d.innerHTML = `
-        <div class="avatar">${role === "user" ? "You" : "AI"}</div>
+        <div class="avatar">
+            ${role === "user" ? "You" : "AI"}
+        </div>
 
         <div class="bubble">
             ${md(text)}
-            <div class="message-actions">${ttsButton}</div>
+            <div class="message-actions">
+                ${ttsButton}
+            </div>
         </div>
     `;
 
     if (chatEl) {
+
         chatEl.appendChild(d);
+
         chatEl.scrollTop = chatEl.scrollHeight;
     }
 }
 
 function typing() {
+
     document.getElementById("welcome")?.remove();
 
     const d = document.createElement("div");
+
     d.className = "msg assistant";
     d.id = "typing";
 
@@ -332,7 +599,9 @@ function typing() {
     `;
 
     if (chatEl) {
+
         chatEl.appendChild(d);
+
         chatEl.scrollTop = chatEl.scrollHeight;
     }
 }
@@ -342,6 +611,7 @@ function typing() {
 ======================================================== */
 
 function render() {
+
     if (!chips) return;
 
     chips.innerHTML = attachments
@@ -349,7 +619,11 @@ function render() {
             (x, i) => `
                 <div class="chip">
                     ${esc(x.filename)}
-                    <button type="button" onclick="removeA(${i})">×</button>
+                    <button
+                        type="button"
+                        onclick="removeA(${i})">
+                        ×
+                    </button>
                 </div>
             `
         )
@@ -357,37 +631,55 @@ function render() {
 }
 
 window.removeA = function (i) {
+
     attachments.splice(i, 1);
+
     render();
 };
 
 if (attach && input) {
+
     attach.onclick = () => input.click();
 }
 
 if (input) {
+
     input.onchange = async () => {
+
         for (const file of input.files) {
+
             try {
+
                 const form = new FormData();
+
                 form.append("file", file);
 
-                const response = await authenticatedFetch("/api/upload", {
-                    method: "POST",
-                    body: form
-                });
+                const response = await authenticatedFetch(
+                    "/api/upload",
+                    {
+                        method: "POST",
+                        body: form
+                    }
+                );
 
                 const data = await response.json();
 
                 if (!response.ok) {
-                    throw new Error(data.detail || "Upload failed.");
+                    throw new Error(
+                        data.detail || "Upload failed."
+                    );
                 }
 
                 attachments.push(data);
+
                 render();
 
             } catch (error) {
-                add("assistant", "Upload error: " + error.message);
+
+                add(
+                    "assistant",
+                    "Upload error: " + error.message
+                );
             }
         }
 
@@ -396,95 +688,225 @@ if (input) {
 }
 
 /* ========================================================
+   MODEL SELECTOR
+======================================================== */
+
+async function loadAvailableModels() {
+
+    if (!modelSelect || !getToken()) return;
+
+    try {
+
+        const response = await authenticatedFetch(
+            "/api/models"
+        );
+
+        if (!response.ok) {
+            throw new Error("Could not load model list.");
+        }
+
+        const data = await response.json();
+
+        if (
+            !Array.isArray(data.models) ||
+            data.models.length === 0
+        ) {
+            return;
+        }
+
+        const previousSelection = modelSelect.value;
+
+        modelSelect.replaceChildren();
+
+        for (const model of data.models) {
+
+            const option = document.createElement("option");
+
+            option.value = model.id;
+            option.textContent = model.label;
+            option.title = model.description || "";
+
+            modelSelect.appendChild(option);
+        }
+
+        const validPrevious = data.models.some(
+            (model) => model.id === previousSelection
+        );
+
+        modelSelect.value = validPrevious
+            ? previousSelection
+            : (data.default_model || data.models[0].id);
+
+    } catch (error) {
+
+        console.error(
+            "Model list could not be loaded:",
+            error
+        );
+    }
+}
+
+/* ========================================================
    CHAT
 ======================================================== */
 
 async function sendMessage() {
-    const text = msgEl ? msgEl.value.trim() : "";
+
+    const text = msgEl
+        ? msgEl.value.trim()
+        : "";
 
     if (!text) return;
 
     add("user", text);
 
-    /* History sent to the server excludes the current message. */
+    // Preserve the previous conversation history.
     const old = history.slice();
 
-    history.push({ role: "user", content: text });
+    history.push({
+        role: "user",
+        content: text
+    });
 
     if (msgEl) {
+
         msgEl.value = "";
         msgEl.style.height = "auto";
     }
 
     typing();
 
-    if (send) send.disabled = true;
+    if (send) {
+        send.disabled = true;
+    }
 
     try {
-        const response = await authenticatedFetch("/api/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                message: text,
-                history: old,
-                file_ids: attachments.map((x) => x.file_id),
-                use_web: true
-            })
-        });
+
+        const response = await authenticatedFetch(
+            "/api/chat",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+
+                    message: text,
+
+                    history: old,
+
+                    file_ids: attachments.map(
+                        (x) => x.file_id
+                    ),
+
+                    use_web: true,
+
+                    model: modelSelect
+                        ? modelSelect.value
+                        : "qwen-ollama"
+
+                })
+            }
+        );
 
         const data = await response.json();
 
         document.getElementById("typing")?.remove();
 
         if (!response.ok) {
-            throw new Error(data.detail || "Chat failed.");
+
+            throw new Error(
+                data.detail || "Chat failed."
+            );
         }
 
         add("assistant", data.answer);
 
-        history.push({ role: "assistant", content: data.answer });
+        history.push({
+            role: "assistant",
+            content: data.answer
+        });
+
+        // Clear uploaded file selections after successful submission.
+        attachments = [];
+
+        render();
 
     } catch (error) {
+
         document.getElementById("typing")?.remove();
 
-        add("assistant", "Error: " + error.message);
+        add(
+            "assistant",
+            "Error: " + error.message
+        );
 
-        /* Remove the failed user message from history. */
-        if (history.length > 0 && history[history.length - 1].role === "user") {
+        // Remove failed user message from history.
+        if (
+            history.length > 0 &&
+            history[history.length - 1].role === "user"
+        ) {
             history.pop();
         }
 
     } finally {
-        if (send) send.disabled = false;
-        if (msgEl) msgEl.focus();
+
+        if (send) {
+            send.disabled = false;
+        }
+
+        if (msgEl) {
+            msgEl.focus();
+        }
     }
 }
 
 if (send) {
+
     send.onclick = sendMessage;
 }
 
 if (msgEl) {
+
     msgEl.onkeydown = (event) => {
-        if (event.key === "Enter" && !event.shiftKey) {
+
+        if (
+            event.key === "Enter" &&
+            !event.shiftKey
+        ) {
+
             event.preventDefault();
+
             sendMessage();
         }
     };
 
     msgEl.oninput = () => {
+
         msgEl.style.height = "auto";
-        msgEl.style.height = Math.min(msgEl.scrollHeight, 180) + "px";
+
+        msgEl.style.height =
+            Math.min(msgEl.scrollHeight, 180) + "px";
     };
 }
 
+/* ========================================================
+   NEW CHAT
+======================================================== */
+
 if (newChat) {
+
     newChat.onclick = () => {
+
         history = [];
+
         attachments = [];
+
         render();
 
-        if (chatEl) chatEl.innerHTML = WELCOME_HTML;
+        if (chatEl) {
+            chatEl.innerHTML = WELCOME_HTML;
+        }
     };
 }
 
@@ -493,83 +915,146 @@ if (newChat) {
 ======================================================== */
 
 async function startMic() {
+
     if (!navigator.mediaDevices) {
-        throw new Error("Microphone access is not supported by this browser.");
+
+        throw new Error(
+            "Microphone access is not supported by this browser."
+        );
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const stream =
+        await navigator.mediaDevices.getUserMedia({
+            audio: true
+        });
 
-    recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+    const mimeType = MediaRecorder.isTypeSupported(
+        "audio/webm"
+    )
+        ? "audio/webm"
+        : "";
+
+    recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
 
     chunks = [];
 
     recorder.ondataavailable = (event) => {
-        if (event.data.size) chunks.push(event.data);
+
+        if (event.data.size) {
+            chunks.push(event.data);
+        }
     };
 
     recorder.onstop = async () => {
-        stream.getTracks().forEach((track) => track.stop());
+
+        stream.getTracks().forEach(
+            (track) => track.stop()
+        );
 
         if (mic) {
+
             mic.classList.remove("recording");
+
             mic.textContent = "🎤";
         }
 
         const form = new FormData();
 
+        const actualMimeType =
+            recorder.mimeType || "audio/webm";
+
         form.append(
             "file",
-            new Blob(chunks, { type: "audio/webm" }),
+            new Blob(chunks, {
+                type: actualMimeType
+            }),
             "microphone.webm"
         );
 
         try {
-            if (mic) mic.disabled = true;
 
-            const response = await authenticatedFetch("/api/transcribe", {
-                method: "POST",
-                body: form
-            });
+            if (mic) {
+                mic.disabled = true;
+            }
+
+            const response = await authenticatedFetch(
+                "/api/transcribe",
+                {
+                    method: "POST",
+                    body: form
+                }
+            );
 
             const data = await response.json();
 
             if (!response.ok) {
-                throw new Error(data.detail || "Transcription failed.");
+
+                throw new Error(
+                    data.detail || "Transcription failed."
+                );
             }
 
             if (msgEl) {
+
                 msgEl.value = data.text || "";
-                msgEl.dispatchEvent(new Event("input"));
+
+                msgEl.dispatchEvent(
+                    new Event("input")
+                );
             }
 
             if (data.text && data.text.trim()) {
+
                 await sendMessage();
             }
 
         } catch (error) {
-            add("assistant", "Microphone error: " + error.message);
+
+            add(
+                "assistant",
+                "Microphone error: " + error.message
+            );
 
         } finally {
-            if (mic) mic.disabled = false;
+
+            if (mic) {
+                mic.disabled = false;
+            }
         }
     };
 
     recorder.start();
 
     if (mic) {
+
         mic.classList.add("recording");
+
         mic.textContent = "■";
     }
 }
 
 if (mic) {
+
     mic.onclick = () => {
-        if (recorder && recorder.state === "recording") {
+
+        if (
+            recorder &&
+            recorder.state === "recording"
+        ) {
+
             recorder.stop();
+
         } else {
-            startMic().catch((error) =>
-                add("assistant", "Microphone error: " + error.message)
-            );
+
+            startMic().catch((error) => {
+
+                add(
+                    "assistant",
+                    "Microphone error: " + error.message
+                );
+            });
         }
     };
 }
@@ -579,19 +1064,34 @@ if (mic) {
 ======================================================== */
 
 async function playTTS(button) {
-    const text = decodeURIComponent(button.dataset.text);
+
+    const text = decodeURIComponent(
+        button.dataset.text
+    );
+
+    let audioURL = null;
 
     try {
+
         button.disabled = true;
+
         button.textContent = "⏳";
 
-        const response = await authenticatedFetch("/api/tts", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text: text })
-        });
+        const response = await authenticatedFetch(
+            "/api/tts",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    text
+                })
+            }
+        );
 
         if (!response.ok) {
+
             let errorData = {};
 
             try {
@@ -600,32 +1100,47 @@ async function playTTS(button) {
                 errorData = {};
             }
 
-            throw new Error(errorData.detail || "TTS failed.");
+            throw new Error(
+                errorData.detail || "TTS failed."
+            );
         }
 
         const audioBlob = await response.blob();
-        const audioURL = URL.createObjectURL(audioBlob);
+
+        audioURL = URL.createObjectURL(audioBlob);
+
         const audio = new Audio(audioURL);
 
         button.textContent = "🔊";
 
         audio.onended = () => {
+
             URL.revokeObjectURL(audioURL);
+
             button.disabled = false;
         };
 
         audio.onerror = () => {
+
             URL.revokeObjectURL(audioURL);
+
             button.disabled = false;
+
             button.textContent = "🔊";
         };
 
         await audio.play();
 
     } catch (error) {
+
         console.error("TTS error:", error);
 
+        if (audioURL) {
+            URL.revokeObjectURL(audioURL);
+        }
+
         button.textContent = "🔊";
+
         button.disabled = false;
 
         alert("TTS error: " + error.message);
@@ -637,20 +1152,29 @@ async function playTTS(button) {
 ======================================================== */
 
 async function check() {
+
     if (!health) return;
 
     try {
+
         const response = await fetch("/api/health");
+
+        if (!response.ok) {
+
+            health.textContent = "";
+
+            return;
+        }
+
         const data = await response.json();
 
         health.textContent =
             data.ollama && data.model_found
-                ? "● Ollama ready"
-                : "● " + (data.detail || "Model not ready");
+                ? "● User Preferred Model"
+                : "User Preferred Model";
 
     } catch (error) {
-        health.textContent = "● Backend unavailable";
+
+        health.textContent = "";
     }
 }
-
-check();

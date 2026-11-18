@@ -1,0 +1,225 @@
+--- main.py
++++ main.py.patched
+@@ -553,6 +553,24 @@
+ 
+ 
+ # ============================================================
++# OKF + JEV KNOWLEDGE LAYER
++# ============================================================
++
++from okf_jev import OKFJEVService
++
++_okf_dir = Path(os.getenv("OKF_KNOWLEDGE_DIR", "knowledge"))
++if not _okf_dir.is_absolute():
++    _okf_dir = BASE_DIR / _okf_dir
++
++OKF_JEV = OKFJEVService(
++    _okf_dir,
++    jev_api_key=os.getenv("JEV_API_KEY", ""),
++    jev_base_url=os.getenv("JEV_BASE_URL", "https://jevmodel.net/v1/systemone"),
++    jev_model=os.getenv("JEV_MODEL", "jev-latest"),
++)
++
++
++# ============================================================
+ # CELERY
+ # ============================================================
+ 
+@@ -617,6 +635,18 @@
+ async def lifespan(app):
+     weather_started = False
+     drive_started = False
++
++    try:
++        okf_result = await OKF_JEV.initialize()
++        print(
++            "[OKF] Bundle initialized:",
++            f"valid={okf_result.get('valid')}",
++            f"documents={okf_result.get('documents', 0)}",
++            f"errors={len(okf_result.get('errors', []))}",
++        )
++        print("[Jev] Decision routing:", "configured" if OKF_JEV.jev_configured else "local fallback")
++    except Exception as exc:
++        print(f"[OKF] Initialization failed; local fallback remains available: {type(exc).__name__}")
+ 
+     try:
+         await start_mcp_client()
+@@ -1253,8 +1283,86 @@
+             "REDTEAM_ENABLED",
+             "true",
+         ).lower() == "true",
++        "okf_jev": {
++            "enabled": OKF_JEV.enabled,
++            "jev_configured": OKF_JEV.jev_configured,
++            "document_count": len(OKF_JEV.documents),
++            "bundle_valid": OKF_JEV.last_validation.get("valid"),
++        },
+     }
+ 
++
++
++# ============================================================
++# OKF MANAGEMENT ROUTES
++# ============================================================
++
++def require_okf_admin(current_user):
++    """Restrict bundle management and diagnostics to administrators."""
++    if str(getattr(current_user, "role", "")).lower() != "admin":
++        raise HTTPException(status_code=403, detail="Administrator role required for OKF management.")
++    return current_user
++
++
++@app.get("/api/okf/status")
++async def okf_status(current_user=Depends(get_current_user)):
++    require_okf_admin(current_user)
++    return OKF_JEV.status()
++
++
++@app.post("/api/okf/validate")
++async def okf_validate(current_user=Depends(get_current_user)):
++    user = require_okf_admin(current_user)
++    result = await asyncio.to_thread(OKF_JEV.validate_bundle)
++    safe_audit(
++        "okf_bundle_validated",
++        user_id=user.user_id,
++        username=user.username,
++        valid=result.get("valid"),
++        document_count=result.get("documents", 0),
++        error_count=len(result.get("errors", [])),
++    )
++    return result
++
++
++@app.post("/api/okf/reindex")
++async def okf_reindex(current_user=Depends(get_current_user)):
++    """Reload the local OKF Markdown bundle; this does not mutate Qdrant."""
++    user = require_okf_admin(current_user)
++    documents = await asyncio.to_thread(OKF_JEV.load_bundle)
++    validation = await asyncio.to_thread(OKF_JEV.validate_bundle)
++    safe_audit(
++        "okf_bundle_reloaded",
++        user_id=user.user_id,
++        username=user.username,
++        document_count=len(documents),
++        valid=validation.get("valid"),
++    )
++    return {"status": "reloaded", "document_count": len(documents), "validation": validation}
++
++
++@app.get("/api/okf/search")
++async def okf_search(
++    q: str,
++    top_k: int = 3,
++    current_user=Depends(get_current_user),
++):
++    """Preview OKF retrieval for an authenticated user."""
++    if not q.strip():
++        raise HTTPException(status_code=400, detail="Query must not be empty.")
++    result = await OKF_JEV.retrieve(q[:2000], top_k=max(1, min(top_k, 10)))
++    safe_audit(
++        "okf_search",
++        user_id=current_user.user_id,
++        username=current_user.username,
++        result_count=len(result.get("sources", [])),
++        decision_provider=(result.get("decision") or {}).get("provider"),
++    )
++    return {
++        "sources": result.get("sources", []),
++        "context": result.get("context", ""),
++        "decision": result.get("decision", {}),
++    }
+ 
+ 
+ # ============================================================
+@@ -2895,6 +3003,56 @@
+         relevant_retrieved
+     )
+ 
++    # ========================================================
++    # OKF + JEV CURATED KNOWLEDGE
++    # ========================================================
++
++    okf_context = ""
++    okf_sources: list[dict[str, Any]] = []
++    okf_decision: dict[str, Any] = {
++        "provider": "none",
++        "route": "other",
++        "confidence": 0.0,
++    }
++
++    try:
++        okf_result = await OKF_JEV.retrieve(query)
++        okf_context = str(okf_result.get("context", "") or "")
++        okf_sources = list(okf_result.get("sources", []) or [])
++        okf_decision = dict(okf_result.get("decision", {}) or {})
++        if okf_context:
++            safe_audit(
++                "okf_context_selected",
++                request_id=request_id,
++                user_id=user.user_id,
++                source_count=len(okf_sources),
++                decision_provider=okf_decision.get("provider"),
++                route=okf_decision.get("route"),
++                confidence=okf_decision.get("confidence"),
++            )
++    except Exception as exc:
++        CHAT_ERRORS.inc()
++        safe_audit(
++            "okf_retrieval_error",
++            request_id=request_id,
++            user_id=user.user_id,
++            error=type(exc).__name__,
++        )
++        okf_context = ""
++        okf_sources = []
++
++    sources.extend(okf_sources)
++    used_okf = bool(okf_context)
++
++    safe_audit(
++        "okf_retrieval_completed",
++        request_id=request_id,
++        user_id=user.user_id,
++        used_okf=used_okf,
++        source_count=len(okf_sources),
++        decision_provider=okf_decision.get("provider"),
++    )
++
+     safe_audit(
+         "rag_context_selected",
+         request_id=request_id,
+@@ -3065,6 +3223,18 @@
+             )
+         )
+ 
++    if okf_context:
++        if combined_context:
++            combined_context += (
++                "\n\n"
++                "===== CURATED OKF KNOWLEDGE (UNTRUSTED REFERENCE) =====\n\n"
++            )
++        else:
++            combined_context = (
++                "===== CURATED OKF KNOWLEDGE (UNTRUSTED REFERENCE) =====\n\n"
++            )
++        combined_context += okf_context
++
+     if web_context:
+ 
+         if combined_context:
+@@ -4078,6 +4248,7 @@
+         username=user.username,
+         role=user.role,
+         used_rag=used_rag,
++        used_okf=used_okf,
+         used_web=used_web,
+         images_sent=image_count,
+         source_count=len(
+@@ -4110,6 +4281,7 @@
+         "answer": answer,
+         "sources": sources,
+         "used_rag": used_rag,
++        "used_okf": used_okf,
+         "used_web": used_web,
+         "images_sent": image_count,
+     }

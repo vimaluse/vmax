@@ -1,6 +1,7 @@
 from celery import Celery
+import time 
 
-
+time.sleep(5)
 celery_app = Celery(
 
     "rag_chatbot",

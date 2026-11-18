@@ -41,14 +41,14 @@ HALLUCINATION_TIMEOUT = int(
 MAX_CONTEXT_CHARS = int(
     os.getenv(
         "VERIFICATION_MAX_CONTEXT_CHARS",
-        "6000"
+        "12000"
     )
 )
 
 MAX_OUTPUT_TOKENS = int(
     os.getenv(
         "VERIFICATION_MAX_OUTPUT_TOKENS",
-        "256"
+        "512"
     )
 )
 
@@ -161,33 +161,22 @@ def extract_json(text: str) -> Dict[str, Any] | None:
 # BUILD REFERENCE CONTEXT
 # ============================================================
 
+
 def build_context(
     retrieved_documents: List[Dict[str, Any]] | None = None,
-    web_content: str | None = None
+    web_content: str | None = None,
+    okf_context: str | None = None,
 ) -> str:
-
     parts = []
 
-    # --------------------------------------------------------
     # RAG DOCUMENTS
-    # --------------------------------------------------------
-
-    for index, doc in enumerate(
-        retrieved_documents or [],
-        start=1
-    ):
-
-        text = str(
-            doc.get("text", "")
-        ).strip()
+    for index, doc in enumerate(retrieved_documents or [], start=1):
+        text = str(doc.get("text", "")).strip()
 
         if not text:
             continue
 
-        filename = doc.get(
-            "filename",
-            "Unknown document"
-        )
+        filename = doc.get("filename", "Unknown document")
 
         parts.append(
             f"[DOCUMENT {index}]\n"
@@ -195,18 +184,21 @@ def build_context(
             f"{text}"
         )
 
-    # --------------------------------------------------------
+    # CURATED OKF KNOWLEDGE
+    if okf_context:
+        okf_text = str(okf_context).strip()
+
+        if okf_text:
+            parts.append(
+                "[OKF CURATED KNOWLEDGE - UNTRUSTED REFERENCE]\n"
+                f"{okf_text}"
+            )
+
     # WEB CONTENT
-    # --------------------------------------------------------
-
     if web_content:
-
-        web_text = str(
-            web_content
-        ).strip()
+        web_text = str(web_content).strip()
 
         if web_text:
-
             parts.append(
                 "[WEB INFORMATION]\n"
                 f"{web_text}"
@@ -215,6 +207,7 @@ def build_context(
     context = "\n\n".join(parts)
 
     return context[:MAX_CONTEXT_CHARS]
+
 
 
 # ============================================================
@@ -472,7 +465,8 @@ def check_grounding(
     question: str,
     answer: str,
     retrieved_documents: List[Dict[str, Any]] | None = None,
-    web_content: str | None = None
+    web_content: str | None = None,
+    okf_context: str |None = None,
 ) -> Dict[str, Any]:
 
     print()
@@ -506,13 +500,25 @@ def check_grounding(
 
     context = build_context(
         retrieved_documents=retrieved_documents,
-        web_content=web_content
+        web_content=web_content,
+        okf_context=okf_context,
     )
 
     print(
         f"[Hallucination] Evidence available: "
         f"{len(context)} characters"
     )
+    print("\n========== GROUNDING DEBUG ==========")
+    print(f"[DEBUG] Question: {question}")
+    print(f"[DEBUG] Answer: {answer[:500]}")
+    print(f"[DEBUG] Retrieved documents: {len(retrieved_documents or [])}")
+    print(f"[DEBUG] Web content length: {len(web_content or '')}")
+    print(f"[DEBUG] OKF context length: {len(okf_context or '')}")
+
+    print("\n[DEBUG] Reference context preview:")
+    print(context[:1500])
+
+    print("=====================================\n")
 
     # No evidence means we cannot verify.
     if not context.strip():

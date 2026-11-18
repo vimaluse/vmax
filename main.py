@@ -6,20 +6,51 @@ import re
 import tempfile
 import time
 import uuid
-
+import redis
+from qdrant_client import QdrantClient
+import json
 from pathlib import Path
 from typing import Any
+
+from rag import retrieve as rag_retrieve
 
 import httpx
 import uvicorn
 
 from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
+from prometheus_client import Gauge
+user_last_activity = Gauge(
+    "chatbot_user_last_activity_timestamp",
+    "Unix timestamp of the user's last activity",
+    ["user"]
+)
+
+
+
+CHAT_REQUESTS = Counter(
+    "chat_requests_total",
+    "Total number of chat requests"
+)
+
+CHAT_ERRORS = Counter(
+    "chat_errors_total",
+    "Total number of chat errors"
+)
+
+CHAT_RESPONSE_TIME = Histogram(
+    "chat_response_time_seconds",
+    "Chatbot response time in seconds",
+    buckets=(0.5, 1, 2, 3, 5, 10, 15, 30, 60)
+)
 
 from starlette.background import BackgroundTask
 from dotenv import load_dotenv
 
 from fastapi import (
     Depends,
+    Cookie,
     FastAPI,
     File,
     HTTPException,
@@ -38,7 +69,11 @@ import sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+
+
+
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 # ============================================================
 # MCP WEATHER SERVER
@@ -50,117 +85,83 @@ MCP_SERVER_PATH = (
     / "weather_server.py"
 )
 
-mcp_session = None
-mcp_stdio_context = None
-mcp_session_context = None
 
-MCP_TOOLS = []
+# ============================================================
+# MCP GOOGLE DRIVE SERVER CONFIGURATION
+# ============================================================
+
+GOOGLE_DRIVE_MCP_PATH = (
+    BASE_DIR
+    / "google-drive-mcp"
+    / "server.py"
+)
 
 # ============================================================
 # MCP CLIENT START
 # ============================================================
 
-async def start_mcp_client():
+# Weather MCP client state
+mcp_session = None
+mcp_stdio_context = None
+mcp_session_context = None
+MCP_TOOLS = []
 
+# Google Drive MCP client state
+google_drive_mcp_session = None
+google_drive_stdio_context = None
+google_drive_session_context = None
+GOOGLE_DRIVE_TOOLS = []
+
+
+async def start_mcp_client():
+    """Start the existing Weather MCP server."""
     global mcp_session
     global mcp_stdio_context
     global mcp_session_context
     global MCP_TOOLS
 
     if not MCP_SERVER_PATH.exists():
-
         raise RuntimeError(
             f"MCP server not found: {MCP_SERVER_PATH}"
         )
 
     server_params = StdioServerParameters(
         command=sys.executable,
-        args=[
-            str(MCP_SERVER_PATH)
-        ],
+        args=[str(MCP_SERVER_PATH)],
     )
 
-    mcp_stdio_context = stdio_client(
-        server_params
-    )
+    mcp_stdio_context = stdio_client(server_params)
+    read_stream, write_stream = await mcp_stdio_context.__aenter__()
 
-    read_stream, write_stream = (
-        await mcp_stdio_context.__aenter__()
-    )
-
-    mcp_session_context = ClientSession(
-        read_stream,
-        write_stream,
-    )
-
-    mcp_session = (
-        await mcp_session_context.__aenter__()
-    )
-
+    mcp_session_context = ClientSession(read_stream, write_stream)
+    mcp_session = await mcp_session_context.__aenter__()
     await mcp_session.initialize()
 
-    tools_result = (
-        await mcp_session.list_tools()
-    )
+    tools_result = await mcp_session.list_tools()
+    MCP_TOOLS = list(tools_result.tools)
 
-    MCP_TOOLS = list(
-        tools_result.tools
-    )
+    print("[MCP] Connected to Weather Server.")
+    print("[MCP] Available tools:", [tool.name for tool in MCP_TOOLS])
 
-    print(
-        "[MCP] Connected to Weather Server."
-    )
-
-    print(
-        "[MCP] Available tools:",
-        [
-            tool.name
-            for tool in MCP_TOOLS
-        ],
-    )
-
-
-# ============================================================
-# MCP CLIENT STOP
-# ============================================================
 
 async def stop_mcp_client():
-
+    """Stop the existing Weather MCP server."""
     global mcp_session
     global mcp_stdio_context
     global mcp_session_context
+    global MCP_TOOLS
 
     if mcp_session_context is not None:
-
         try:
-
-            await mcp_session_context.__aexit__(
-                None,
-                None,
-                None,
-            )
-
+            await mcp_session_context.__aexit__(None, None, None)
         except Exception as exc:
-
-            print(
-                f"[MCP] Session shutdown error: {exc}"
-            )
+            print(f"[MCP] Session shutdown error: {exc}")
 
     if mcp_stdio_context is not None:
-
         try:
-
-            await mcp_stdio_context.__aexit__(
-                None,
-                None,
-                None,
-            )
-
+            await mcp_stdio_context.__aexit__(None, None, None)
         except Exception as exc:
-
-            print(
-                f"[MCP] Transport shutdown error: {exc}"
-            )
+            print(f"[MCP] Transport shutdown error: {exc}")
 
     mcp_session = None
     mcp_session_context = None
@@ -168,64 +169,114 @@ async def stop_mcp_client():
     MCP_TOOLS = []
 
 
-async def call_mcp_weather(city: str) -> str:
+# ============================================================
+# GOOGLE DRIVE MCP CLIENT START
+# ============================================================
 
-    if mcp_session is None:
+async def start_google_drive_mcp():
+    """Start the Google Drive MCP server as a child process."""
+    global google_drive_mcp_session
+    global google_drive_stdio_context
+    global google_drive_session_context
+    global GOOGLE_DRIVE_TOOLS
+
+    if not GOOGLE_DRIVE_MCP_PATH.exists():
         raise RuntimeError(
-            "MCP Weather Server is not connected."
+            f"Google Drive MCP server not found: {GOOGLE_DRIVE_MCP_PATH}"
         )
 
-    try:
-
-        result = await mcp_session.call_tool(
-            "get_weather",
-            {
-                "city": city
-            },
-        )
-
-        # MCP TextContent result
-        if result.content:
-
-            texts = []
-
-            for item in result.content:
-
-                if hasattr(item, "text"):
-                    texts.append(item.text)
-
-            if texts:
-                return "\n".join(texts)
-
-        return "Weather tool returned no result."
-
-    except Exception as exc:
-
-        print(
-            f"[MCP] Weather tool call failed: {exc}"
-        )
-
-        raise
-
-def is_weather_question(query: str) -> bool:
-    weather_keywords = [
-        "weather",
-        "temperature",
-        "forecast",
-        "rain",
-        "raining",
-        "humidity",
-        "wind speed",
-        "hot",
-        "cold",
-    ]
-
-    query_lower = query.lower()
-
-    return any(
-        keyword in query_lower
-        for keyword in weather_keywords
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=[str(GOOGLE_DRIVE_MCP_PATH)],
     )
+
+    google_drive_stdio_context = stdio_client(server_params)
+    read_stream, write_stream = (
+        await google_drive_stdio_context.__aenter__()
+    )
+
+    google_drive_session_context = ClientSession(
+        read_stream,
+        write_stream,
+    )
+    google_drive_mcp_session = (
+        await google_drive_session_context.__aenter__()
+    )
+
+    await google_drive_mcp_session.initialize()
+    tools_result = await google_drive_mcp_session.list_tools()
+    GOOGLE_DRIVE_TOOLS = list(tools_result.tools)
+
+    print("[MCP] Connected to Google Drive Server.")
+    print(
+        "[MCP] Google Drive tools:",
+        [tool.name for tool in GOOGLE_DRIVE_TOOLS],
+    )
+
+
+async def stop_google_drive_mcp():
+    """Stop the Google Drive MCP server."""
+    global google_drive_mcp_session
+    global google_drive_stdio_context
+    global google_drive_session_context
+    global GOOGLE_DRIVE_TOOLS
+
+    if google_drive_session_context is not None:
+        try:
+            await google_drive_session_context.__aexit__(None, None, None)
+        except Exception as exc:
+            print(f"[MCP] Google Drive session shutdown error: {exc}")
+
+    if google_drive_stdio_context is not None:
+        try:
+            await google_drive_stdio_context.__aexit__(None, None, None)
+        except Exception as exc:
+            print(f"[MCP] Google Drive transport shutdown error: {exc}")
+
+    google_drive_mcp_session = None
+    google_drive_session_context = None
+    google_drive_stdio_context = None
+    GOOGLE_DRIVE_TOOLS = []
+
+
+async def call_google_drive_tool(
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+):
+    """Call an available Google Drive MCP tool."""
+    if google_drive_mcp_session is None:
+        raise RuntimeError("Google Drive MCP Server is not connected.")
+
+    allowed_tools = {
+        tool.name for tool in GOOGLE_DRIVE_TOOLS
+    }
+    if tool_name not in allowed_tools:
+        raise ValueError(f"Unknown Google Drive MCP tool: {tool_name}")
+
+    result = await google_drive_mcp_session.call_tool(
+        tool_name,
+        arguments or {},
+    )
+
+    if getattr(result, "isError", False):
+        error_text = "\\n".join(
+            item.text for item in (result.content or [])
+            if hasattr(item, "text")
+        )
+        raise RuntimeError(
+            error_text or f"Google Drive tool '{tool_name}' failed."
+        )
+
+    structured_content = getattr(result, "structuredContent", None)
+    if structured_content is not None:
+        return structured_content
+
+    texts = [
+        item.text for item in (result.content or [])
+        if hasattr(item, "text")
+    ]
+    return "\\n".join(texts) if texts else result
+
 
 def extract_weather_cities(query: str) -> str:
     query_lower = query.lower()
@@ -260,6 +311,9 @@ def extract_weather_cities(query: str) -> str:
 from security.auth import (
     authenticate_user,
     create_access_token,
+    create_refresh_token,
+    consume_refresh_token,
+    revoke_refresh_token,
     get_current_user,
 )
 
@@ -355,9 +409,7 @@ def safe_audit(
 # ENVIRONMENT
 # ============================================================
 
-load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent
 
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 
@@ -373,7 +425,35 @@ OLLAMA_URL = os.getenv(
 ).rstrip("/")
 
 
-OLLAMA_MODEL = DEFAULT_MODEL
+OLLAMA_MODEL = DEFAULT_MODEL  # retained for legacy health/status reporting
+
+# The frontend sends only these aliases. Underlying provider model names are
+# kept server-side in LiteLLM configuration.
+QWEN_OLLAMA_MODEL = os.getenv("OLLAMA_QWEN_MODEL", "qwen3.5:9b")
+DEFAULT_CHAT_MODEL = os.getenv("AI_DEFAULT_MODEL", "gemma4:latest-ollama")
+MODEL_REGISTRY: dict[str, dict[str, str]] = {
+    "qwen-ollama": {
+        "label": "Qwen (Ollama)",
+        "description": "Qwen running locally through Ollama",
+        "provider_model": QWEN_OLLAMA_MODEL,
+        "security_model": QWEN_OLLAMA_MODEL,
+    },
+    "gemini-3.6-flash": {
+        "label": "Gemini 3.6 Flash",
+        "description": "Google Gemini 3.6 Flash via the AI gateway",
+        "provider_model": "gemini-3.6-flash",
+        "security_model": "gemini-3.6-flash",
+    },
+}
+
+if DEFAULT_CHAT_MODEL not in MODEL_REGISTRY:
+    DEFAULT_CHAT_MODEL = "qwen-ollama"
+
+AI_GATEWAY_URL = os.getenv(
+    "AI_GATEWAY_URL",
+    "http://localhost:4000/v1",
+).rstrip("/")
+LITELLM_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "")
 
 
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024
@@ -479,6 +559,24 @@ from rag import (
 
 
 # ============================================================
+# OKF + JEV KNOWLEDGE LAYER
+# ============================================================
+
+from okf_jev import OKFJEVService
+
+_okf_dir = Path(os.getenv("OKF_KNOWLEDGE_DIR", "knowledge"))
+if not _okf_dir.is_absolute():
+    _okf_dir = BASE_DIR / _okf_dir
+
+OKF_JEV = OKFJEVService(
+    _okf_dir,
+    jev_api_key=os.getenv("JEV_API_KEY", ""),
+    jev_base_url=os.getenv("JEV_BASE_URL", "https://jevmodel.net/v1/systemone"),
+    jev_model=os.getenv("JEV_MODEL", "jev-latest"),
+)
+
+
+# ============================================================
 # CELERY
 # ============================================================
 
@@ -541,22 +639,38 @@ from redteam.api import (
 
 @asynccontextmanager
 async def lifespan(app):
+    weather_started = False
+    drive_started = False
+
+    try:
+        okf_result = await OKF_JEV.initialize()
+        print(
+            "[OKF] Bundle initialized:",
+            f"valid={okf_result.get('valid')}",
+            f"documents={okf_result.get('documents', 0)}",
+            f"errors={len(okf_result.get('errors', []))}",
+        )
+        print("[Jev] Decision routing:", "configured" if OKF_JEV.jev_configured else "local fallback")
+    except Exception as exc:
+        print(f"[OKF] Initialization failed; local fallback remains available: {type(exc).__name__}")
 
     try:
         await start_mcp_client()
+        weather_started = True
+        await start_google_drive_mcp()
+        drive_started = True
         print("[MCP] Startup completed.")
     except Exception as exc:
         print(f"[MCP] Startup failed: {exc}")
-        print("[MCP] FastAPI will continue without MCP.")
+        print("[MCP] FastAPI will continue with available MCP services.")
 
     try:
         yield
-
     finally:
-        try:
+        if drive_started:
+            await stop_google_drive_mcp()
+        if weather_started:
             await stop_mcp_client()
-        except Exception as exc:
-            print(f"[MCP] Shutdown error: {exc}")
 
 
 app = FastAPI(
@@ -645,6 +759,10 @@ class ChatRequest(BaseModel):
     )
 
     use_web: bool = True
+
+    # Public model alias selected in the frontend. The server validates it
+    # against MODEL_REGISTRY; never accept arbitrary provider model strings.
+    model: str | None = None
 
 
 class TTSRequest(BaseModel):
@@ -912,9 +1030,53 @@ def moderate_chat_output(
     )
 
 
+
 # ============================================================
 # AUTHENTICATION
 # ============================================================
+
+REFRESH_COOKIE_NAME = "refresh_token"
+REFRESH_COOKIE_PATH = "/api/auth"
+
+
+def set_refresh_cookie(
+    response: Response,
+    token: str,
+):
+    refresh_days = int(
+        os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30")
+    )
+
+    secure_cookie = (
+        os.getenv("REFRESH_COOKIE_SECURE", "false").lower()
+        in ("true", "1", "yes")
+    )
+
+    response.set_cookie(
+        key=REFRESH_COOKIE_NAME,
+        value=token,
+        max_age=refresh_days * 86400,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="lax",
+        path=REFRESH_COOKIE_PATH,
+    )
+
+
+def clear_refresh_cookie(response: Response):
+    secure_cookie = (
+        os.getenv("REFRESH_COOKIE_SECURE", "false").lower()
+        in ("true", "1", "yes")
+    )
+
+    response.delete_cookie(
+        key=REFRESH_COOKIE_NAME,
+        path=REFRESH_COOKIE_PATH,
+        httponly=True,
+        secure=secure_cookie,
+        samesite="lax",
+    )
+
 
 @app.post(
     "/api/auth/login",
@@ -922,21 +1084,17 @@ def moderate_chat_output(
 )
 async def login(
     request: LoginRequest,
+    response: Response,
 ):
-
-    request_id = str(
-        uuid.uuid4()
-    )
+    request_id = str(uuid.uuid4())
 
     try:
-
         user = authenticate_user(
             request.username,
             request.password,
         )
 
     except Exception as exc:
-
         safe_audit(
             "login_error",
             request_id=request_id,
@@ -950,7 +1108,6 @@ async def login(
         )
 
     if not user:
-
         safe_audit(
             "login_failed",
             request_id=request_id,
@@ -963,13 +1120,22 @@ async def login(
         )
 
     try:
+        token = create_access_token(user)
 
-        token = create_access_token(
-            user
+        refresh_token = create_refresh_token(user)
+
+        set_refresh_cookie(
+            response,
+            refresh_token,
+        )
+
+    except redis.RedisError:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication session storage is unavailable.",
         )
 
     except Exception as exc:
-
         safe_audit(
             "token_creation_error",
             request_id=request_id,
@@ -979,7 +1145,7 @@ async def login(
 
         raise HTTPException(
             status_code=500,
-            detail="Unable to create authentication token.",
+            detail="Unable to create authentication session.",
         )
 
     safe_audit(
@@ -1002,18 +1168,114 @@ async def login(
 
 
 # ============================================================
+# REFRESH ACCESS TOKEN
+# ============================================================
+
+@app.post(
+    "/api/auth/refresh",
+    response_model=TokenResponse,
+)
+async def refresh_access_token(
+    response: Response,
+    refresh_token: str | None = Cookie(
+        default=None,
+        alias=REFRESH_COOKIE_NAME,
+    ),
+):
+    if not refresh_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Refresh session not found. Please login again.",
+        )
+
+    try:
+        user = consume_refresh_token(refresh_token)
+
+        if not user:
+            clear_refresh_cookie(response)
+
+            raise HTTPException(
+                status_code=401,
+                detail="Refresh session expired or invalid. Please login again.",
+            )
+
+        new_access_token = create_access_token(user)
+
+        new_refresh_token = create_refresh_token(user)
+
+        set_refresh_cookie(
+            response,
+            new_refresh_token,
+        )
+
+        safe_audit(
+            "token_refresh_success",
+            user_id=user.user_id,
+            username=user.username,
+        )
+
+        return {
+            "access_token": new_access_token,
+            "token_type": "bearer",
+            "user": {
+                "user_id": user.user_id,
+                "username": user.username,
+                "role": user.role,
+            },
+        }
+
+    except HTTPException:
+        raise
+
+    except redis.RedisError:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication session storage is unavailable.",
+        )
+
+
+# ============================================================
+# LOGOUT
+# ============================================================
+
+@app.post("/api/auth/logout")
+async def logout(
+    response: Response,
+    refresh_token: str | None = Cookie(
+        default=None,
+        alias=REFRESH_COOKIE_NAME,
+    ),
+):
+    try:
+        if refresh_token:
+            revoke_refresh_token(refresh_token)
+
+        clear_refresh_cookie(response)
+
+        safe_audit(
+            "logout_success",
+        )
+
+        return {
+            "success": True,
+            "message": "Logged out successfully.",
+        }
+
+    except redis.RedisError:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to revoke authentication session. Please try again.",
+        )
+
+
+# ============================================================
 # CURRENT USER
 # ============================================================
 
-@app.get(
-    "/api/auth/me"
-)
+@app.get("/api/auth/me")
 async def get_me(
-    current_user=Depends(
-        get_current_user
-    ),
+    current_user=Depends(get_current_user),
 ):
-
     safe_audit(
         "authentication_identity_check",
         user_id=current_user.user_id,
@@ -1028,6 +1290,24 @@ async def get_me(
     }
 
 
+@app.get("/api/models")
+async def list_available_models(
+    current_user=Depends(get_current_user),
+):
+    """Return the frontend-safe model aliases; never expose gateway secrets."""
+    return {
+        "default_model": DEFAULT_CHAT_MODEL,
+        "models": [
+            {
+                "id": model_id,
+                "label": config["label"],
+                "description": config["description"],
+            }
+            for model_id, config in MODEL_REGISTRY.items()
+        ],
+    }
+
+
 # ============================================================
 # MODEL AUTHORIZATION
 # ============================================================
@@ -1035,29 +1315,38 @@ async def get_me(
 def authorize_model_request(
     user,
     request_id: str,
+    selected_model: str,
 ):
 
+    model_config = MODEL_REGISTRY.get(selected_model)
+    if model_config is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported model selection.",
+        )
+
+    security_model = model_config["security_model"]
     decision = authorize_chat(
         user=user,
-        model_name=OLLAMA_MODEL,
+        model_name=security_model,
     )
 
     if not decision.allowed:
-
         safe_audit(
             "model_access_denied",
             request_id=request_id,
             user_id=user.user_id,
             username=user.username,
             role=user.role,
-            model=OLLAMA_MODEL,
+            model=selected_model,
+            provider_model=security_model,
             reasons=decision.reasons,
         )
-
         raise HTTPException(
             status_code=403,
             detail={
                 "error": "Model access denied",
+                "model": selected_model,
                 "reasons": decision.reasons,
             },
         )
@@ -1068,9 +1357,9 @@ def authorize_model_request(
         user_id=user.user_id,
         username=user.username,
         role=user.role,
-        model=OLLAMA_MODEL,
+        model=selected_model,
+        provider_model=security_model,
     )
-
     return decision
 
 
@@ -1078,20 +1367,65 @@ def authorize_model_request(
 # HEALTH
 # ============================================================
 
-@app.get(
-    "/api/health"
-)
+
+@app.get("/api/health")
 async def health():
+    services = {}
+
+    # Check Redis
+    try:
+        redis_client = redis.Redis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            socket_connect_timeout=3,
+            socket_timeout=3,
+        )
+        services["redis"] = (
+            "connected" if redis_client.ping() else "disconnected"
+        )
+        redis_client.close()
+    except Exception:
+        services["redis"] = "disconnected"
+
+    # Check Qdrant
+    try:
+        qdrant_client = QdrantClient(
+            url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+            timeout=3,
+        )
+        qdrant_client.get_collections()
+        services["qdrant"] = "connected"
+        qdrant_client.close()
+    except Exception:
+        services["qdrant"] = "disconnected"
+
+    # Check Ollama
+    try:
+        response = httpx.get(
+            f"{OLLAMA_URL.rstrip('/')}/api/tags",
+            timeout=5,
+        )
+        response.raise_for_status()
+        services["ollama"] = "connected"
+    except Exception:
+        services["ollama"] = "disconnected"
+
+    all_connected = all(
+        status == "connected"
+        for status in services.values()
+    )
+
+    status = "ok" if all_connected else "degraded"
 
     safe_audit(
         "health_check",
-        status="ok",
+        status=status,
         ollama_model=OLLAMA_MODEL,
         moderation_enabled=MODERATION_CONFIG.enabled,
     )
 
     return {
-        "status": "ok",
+        "status": status,
+        "services": services,
         "ollama_url": OLLAMA_URL,
         "ollama_model": OLLAMA_MODEL,
         "moderation_enabled": MODERATION_CONFIG.enabled,
@@ -1099,6 +1433,85 @@ async def health():
             "REDTEAM_ENABLED",
             "true",
         ).lower() == "true",
+        "okf_jev": {
+            "enabled": OKF_JEV.enabled,
+            "jev_configured": OKF_JEV.jev_configured,
+            "document_count": len(OKF_JEV.documents),
+            "bundle_valid": OKF_JEV.last_validation.get("valid"),
+        },
+    }
+
+
+
+# ============================================================
+# OKF MANAGEMENT ROUTES
+# ============================================================
+
+def require_okf_admin(current_user):
+    """Restrict bundle management and diagnostics to administrators."""
+    if str(getattr(current_user, "role", "")).lower() != "admin":
+        raise HTTPException(status_code=403, detail="Administrator role required for OKF management.")
+    return current_user
+
+
+@app.get("/api/okf/status")
+async def okf_status(current_user=Depends(get_current_user)):
+    require_okf_admin(current_user)
+    return OKF_JEV.status()
+
+
+@app.post("/api/okf/validate")
+async def okf_validate(current_user=Depends(get_current_user)):
+    user = require_okf_admin(current_user)
+    result = await asyncio.to_thread(OKF_JEV.validate_bundle)
+    safe_audit(
+        "okf_bundle_validated",
+        user_id=user.user_id,
+        username=user.username,
+        valid=result.get("valid"),
+        document_count=result.get("documents", 0),
+        error_count=len(result.get("errors", [])),
+    )
+    return result
+
+
+@app.post("/api/okf/reindex")
+async def okf_reindex(current_user=Depends(get_current_user)):
+    """Reload the local OKF Markdown bundle; this does not mutate Qdrant."""
+    user = require_okf_admin(current_user)
+    documents = await asyncio.to_thread(OKF_JEV.load_bundle)
+    validation = await asyncio.to_thread(OKF_JEV.validate_bundle)
+    safe_audit(
+        "okf_bundle_reloaded",
+        user_id=user.user_id,
+        username=user.username,
+        document_count=len(documents),
+        valid=validation.get("valid"),
+    )
+    return {"status": "reloaded", "document_count": len(documents), "validation": validation}
+
+
+@app.get("/api/okf/search")
+async def okf_search(
+    q: str,
+    top_k: int = 3,
+    current_user=Depends(get_current_user),
+):
+    """Preview OKF retrieval for an authenticated user."""
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="Query must not be empty.")
+    result = await OKF_JEV.retrieve(q[:2000], top_k=max(1, min(top_k, 10)))
+    safe_audit(
+        "okf_search",
+        user_id=current_user.user_id,
+        username=current_user.username,
+        result_count=len(result.get("sources", [])),
+        decision_provider=(result.get("decision") or {}).get("provider"),
+    )
+    return {
+        "sources": result.get("sources", []),
+        "context": result.get("context", ""),
+        "decision": result.get("decision", {}),
     }
 
 
@@ -1784,28 +2197,59 @@ async def delete_file(
 # OLLAMA CHAT
 # ============================================================
 
-async def call_ollama(
+async def call_ai_gateway(
     messages: list[dict[str, Any]],
+    selected_model: str,
 ):
-
+    """Call the LiteLLM gateway using its OpenAI-compatible API."""
     started = time.perf_counter()
+
+    if selected_model not in MODEL_REGISTRY:
+        raise HTTPException(status_code=400, detail="Unsupported model selection.")
+    if not LITELLM_MASTER_KEY:
+        raise RuntimeError("LITELLM_MASTER_KEY is not configured on the server.")
+
+    # Convert Ollama's {images: [base64, ...]} message format into the
+    # OpenAI-compatible multimodal content format accepted by LiteLLM.
+    gateway_messages: list[dict[str, Any]] = []
+    for original in messages:
+        item = dict(original)
+        images = item.pop("images", None)
+        if images:
+            text_content = item.get("content", "")
+            content: list[dict[str, Any]] = [
+                {"type": "text", "text": str(text_content)}
+            ]
+            for image_item in images:
+                if isinstance(image_item, dict):
+                    encoded = image_item.get("data", "")
+                    mime_type = image_item.get("mime_type", "image/jpeg")
+                else:
+                    encoded = str(image_item)
+                    mime_type = "image/jpeg"
+                if encoded:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{encoded}"
+                        },
+                    })
+            item["content"] = content
+        gateway_messages.append(item)
 
     safe_audit(
         "model_request_started",
-        model=OLLAMA_MODEL,
-        message_count=len(messages),
+        model=selected_model,
+        message_count=len(gateway_messages),
     )
 
     payload = {
-        "model": OLLAMA_MODEL,
-        "messages": messages,
+        "model": selected_model,
+        "messages": gateway_messages,
         "stream": False,
-        "options": {
-            "temperature": 0.3,
-            "top_p": 0.9,
-        },
+        "temperature": 0.3,
+        "top_p": 0.9,
     }
-
     timeout = httpx.Timeout(
         connect=20.0,
         read=300.0,
@@ -1813,53 +2257,42 @@ async def call_ollama(
         pool=60.0,
     )
 
-    async with httpx.AsyncClient(
-        timeout=timeout
-    ) as client:
-
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(
-            f"{OLLAMA_URL}/api/chat",
+            f"{AI_GATEWAY_URL}/chat/completions",
             json=payload,
+            headers={
+                "Authorization": f"Bearer {LITELLM_MASTER_KEY}",
+                "Content-Type": "application/json",
+            },
         )
-
         response.raise_for_status()
-
         data = response.json()
 
-    message = data.get(
-        "message",
-        {},
-    )
-
-    answer = message.get(
-        "content",
-        "",
-    )
+    choices = data.get("choices") or []
+    answer = ""
+    if choices:
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, str):
+            answer = content
+        elif isinstance(content, list):
+            answer = "\n".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
 
     if not answer:
-
-        safe_audit(
-            "model_response_empty",
-            model=OLLAMA_MODEL,
-        )
-
-        raise RuntimeError(
-            "Ollama returned an empty response."
-        )
+        safe_audit("model_response_empty", model=selected_model)
+        raise RuntimeError("The AI gateway returned an empty response.")
 
     safe_audit(
         "model_response_completed",
-        model=OLLAMA_MODEL,
+        model=selected_model,
         answer_length=len(answer),
-        duration_ms=round(
-            (
-                time.perf_counter()
-                - started
-            ) * 1000,
-            2,
-        ),
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
     )
-
     return answer
 
 # ============================================================
@@ -1942,6 +2375,8 @@ def is_weather_question(query: str) -> bool:
         "raining",
         "humidity",
         "wind speed",
+        "hot",
+        "cold",
     ]
 
     query_lower = query.lower()
@@ -2047,6 +2482,14 @@ async def chat(
     ),
 ):
 
+    # ========================================================
+    # PROMETHEUS - USER LAST ACTIVITY
+    # ========================================================
+
+    user_last_activity.labels(
+        user=current_user.username
+    ).set(time.time())
+
     request_id = str(
         uuid.uuid4()
     )
@@ -2054,6 +2497,9 @@ async def chat(
     query = request.message.strip()
 
     chat_started = time.perf_counter()
+
+    #prometheus
+    CHAT_REQUESTS.inc()
 
     user = current_user
 
@@ -2071,12 +2517,23 @@ async def chat(
     )
 
     # ========================================================
-    # MODEL AUTHORIZATION
+    # MODEL SELECTION + AUTHORIZATION
     # ========================================================
+
+    selected_model = request.model or DEFAULT_CHAT_MODEL
+    if selected_model not in MODEL_REGISTRY:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Unsupported model selection.",
+                "available_models": list(MODEL_REGISTRY),
+            },
+        )
 
     authorize_model_request(
         user=user,
         request_id=request_id,
+        selected_model=selected_model,
     )
 
     # ========================================================
@@ -2092,6 +2549,7 @@ async def chat(
         )
 
     except Exception as exc:
+        CHAT_ERRORS.inc()
 
         safe_audit(
             "rate_limit_error",
@@ -2141,6 +2599,7 @@ async def chat(
             request.file_ids
         ),
         use_web=request.use_web,
+        selected_model=selected_model,
     )
 
     if not query:
@@ -2226,6 +2685,7 @@ async def chat(
         )
 
     except Exception as exc:
+        CHAT_ERRORS.inc()
 
         safe_audit(
             "chat_input_guard_error",
@@ -2275,6 +2735,101 @@ async def chat(
         query,
     ) if guard_result else query
 
+    
+    # ========================================================
+    # MCP GOOGLE DRIVE
+    # ========================================================
+
+    normalized_query = query.lower().strip()
+
+    google_drive_keywords = (
+        "google drive",
+        "google-drive",
+        "google drive files",
+        "my drive",
+    )
+
+    list_file_keywords = (
+        "list",
+        "show",
+        "display",
+        "get",
+        "find",
+        "what files",
+        "which files",
+    )
+
+    is_google_drive_request = (
+        any(
+            keyword in normalized_query
+            for keyword in google_drive_keywords
+        )
+        and any(
+            keyword in normalized_query
+            for keyword in list_file_keywords
+        )
+    )
+
+    if is_google_drive_request:
+        try:
+            drive_result = await call_google_drive_tool(
+                "list_drive_files",
+                {},
+            )
+
+            if isinstance(drive_result, str):
+                drive_answer = drive_result
+            else:
+                drive_answer = json.dumps(
+                    drive_result,
+                    indent=2,
+                    ensure_ascii=False,
+                    default=str,
+                )
+
+            safe_audit(
+                "mcp_google_drive_success",
+                request_id=request_id,
+                user_id=user.user_id,
+                tool_name="list_drive_files",
+            )
+
+            return {
+                "answer": drive_answer,
+                "sources": [],
+                "used_rag": False,
+                "used_web": False,
+                "images_sent": 0,
+            }
+
+        except Exception as exc:
+            CHAT_ERRORS.inc()
+
+            print(
+                f"[Google Drive MCP] Request failed: {exc}"
+            )
+
+            safe_audit(
+                "mcp_google_drive_error",
+                request_id=request_id,
+                user_id=user.user_id,
+                tool_name="list_drive_files",
+                error=str(exc),
+            )
+
+            return {
+                "answer": (
+                    "Google Drive is currently unavailable. "
+                    "Check the MCP server connection and "
+                    "Google Drive authorization."
+                ),
+                "sources": [],
+                "used_rag": False,
+                "used_web": False,
+                "images_sent": 0,
+            }
+
+
     # ========================================================
     # MCP WEATHER
     # ========================================================
@@ -2315,6 +2870,7 @@ async def chat(
                 }
 
             except Exception as exc:
+                CHAT_ERRORS.inc()
 
                 print(
                     f"[MCP] Weather request failed: {exc}"
@@ -2373,6 +2929,7 @@ async def chat(
             }
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             print(
                 f"[MCP Weather] Failed: {exc}"
@@ -2389,65 +2946,75 @@ async def chat(
             # Continue to normal chatbot processing
 
     
-    # ========================================================
-    # RAG
-    # ========================================================
+    
+    
+# ========================================================
+# UPLOADED DOCUMENT RAG RETRIEVAL
+# ========================================================
 
-    retrieved: list[
-        dict[str, Any]
-    ] = []
+    retrieved: list[dict[str, Any]] = []
 
-    relevant_retrieved: list[
-        dict[str, Any]
-    ] = []
+    relevant_retrieved: list[dict[str, Any]] = []
 
     context_parts: list[str] = []
 
-    sources: list[
-        dict[str, Any]
-    ] = []
+    sources: list[dict[str, Any]] = []
 
     used_rag = False
 
-    try:
+    # Retrieve only when uploaded document IDs are supplied.
+    # General questions continue without document retrieval.
 
-        retrieved = retrieve(
-            query,
-            file_ids=(
+    if request.file_ids:
+
+        try:
+
+            print("[RAG] Document retrieval started")
+
+            print(
+                "[RAG] File IDs:",
                 request.file_ids
-                or None
-            ),
-            top_k=RAG_TOP_K,
-            user_id=user.user_id,
-        )
+            )
 
-    except Exception as exc:
+            retrieved = await asyncio.to_thread(
+                rag_retrieve,
+                query,
+                file_ids=request.file_ids,
+                user_id=user.user_id,
+            )
+
+            print(
+                "[RAG] Retrieved chunks:",
+                len(retrieved)
+            )
+
+        except Exception as exc:
+
+            CHAT_ERRORS.inc()
+
+            print(
+                f"[RAG] Retrieval failed: {exc}"
+            )
+
+            safe_audit(
+                "rag_retrieval_error",
+                request_id=request_id,
+                user_id=user.user_id,
+                error=str(exc),
+            )
+
+            raise HTTPException(
+                status_code=503,
+                detail="Uploaded document retrieval failed."
+            ) from exc
+
+    else:
 
         print(
-            f"[RAG] Retrieval failed: {exc}"
+            "[RAG] No uploaded document IDs supplied"
         )
 
-        safe_audit(
-            "rag_retrieval_error",
-            request_id=request_id,
-            user_id=user.user_id,
-            error=str(exc),
-        )
 
-        retrieved = []
-
-    safe_audit(
-        "rag_retrieval",
-        request_id=request_id,
-        user_id=user.user_id,
-        requested_file_count=len(
-            request.file_ids
-        ),
-        retrieved_count=len(
-            retrieved or []
-        ),
-        top_k=RAG_TOP_K,
-    )
 
     # ========================================================
     # RAG RELEVANCE
@@ -2556,6 +3123,7 @@ async def chat(
             )
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             print(
                 f"[RAG] Document guard error: {exc}"
@@ -2592,6 +3160,56 @@ async def chat(
 
     used_rag = bool(
         relevant_retrieved
+    )
+
+    # ========================================================
+    # OKF + JEV CURATED KNOWLEDGE
+    # ========================================================
+
+    okf_context = ""
+    okf_sources: list[dict[str, Any]] = []
+    okf_decision: dict[str, Any] = {
+        "provider": "none",
+        "route": "other",
+        "confidence": 0.0,
+    }
+
+    try:
+        okf_result = await OKF_JEV.retrieve(query)
+        okf_context = str(okf_result.get("context", "") or "")
+        okf_sources = list(okf_result.get("sources", []) or [])
+        okf_decision = dict(okf_result.get("decision", {}) or {})
+        if okf_context:
+            safe_audit(
+                "okf_context_selected",
+                request_id=request_id,
+                user_id=user.user_id,
+                source_count=len(okf_sources),
+                decision_provider=okf_decision.get("provider"),
+                route=okf_decision.get("route"),
+                confidence=okf_decision.get("confidence"),
+            )
+    except Exception as exc:
+        CHAT_ERRORS.inc()
+        safe_audit(
+            "okf_retrieval_error",
+            request_id=request_id,
+            user_id=user.user_id,
+            error=type(exc).__name__,
+        )
+        okf_context = ""
+        okf_sources = []
+
+    sources.extend(okf_sources)
+    used_okf = bool(okf_context)
+
+    safe_audit(
+        "okf_retrieval_completed",
+        request_id=request_id,
+        user_id=user.user_id,
+        used_okf=used_okf,
+        source_count=len(okf_sources),
+        decision_provider=okf_decision.get("provider"),
     )
 
     safe_audit(
@@ -2725,6 +3343,7 @@ async def chat(
                 )
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             print(
                 f"[Web Search] Failed: {exc}"
@@ -2762,6 +3381,18 @@ async def chat(
                 context_parts
             )
         )
+
+    if okf_context:
+        if combined_context:
+            combined_context += (
+                "\n\n"
+                "===== CURATED OKF KNOWLEDGE (UNTRUSTED REFERENCE) =====\n\n"
+            )
+        else:
+            combined_context = (
+                "===== CURATED OKF KNOWLEDGE (UNTRUSTED REFERENCE) =====\n\n"
+            )
+        combined_context += okf_context
 
     if web_context:
 
@@ -3335,6 +3966,7 @@ Answer clearly, directly, and concisely.
             )
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             safe_audit(
                 "chat_history_guard_error",
@@ -3427,6 +4059,7 @@ Answer clearly, directly, and concisely.
                     )
 
         except Exception as exc:
+            CHAT_ERRORS.inc()
 
             safe_audit(
                 "image_attachment_error",
@@ -3459,11 +4092,16 @@ Answer clearly, directly, and concisely.
                     )
                 )
 
+                import mimetypes
                 images.append(
-                    encoded
+                    {
+                        "data": encoded,
+                        "mime_type": mimetypes.guess_type(str(image_path))[0] or "image/jpeg",
+                    }
                 )
 
             except Exception as exc:
+                CHAT_ERRORS.inc()
 
                 safe_audit(
                     "image_encoding_error",
@@ -3506,19 +4144,20 @@ Answer clearly, directly, and concisely.
         )
 
     # ========================================================
-    # OLLAMA
+    # AI GATEWAY
     # ========================================================
 
     try:
 
-        answer = await call_ollama(
-            messages
+        answer = await call_ai_gateway(
+            messages,
+            selected_model,
         )
 
     except httpx.HTTPStatusError as exc:
 
         safe_audit(
-            "ollama_http_error",
+            "ai_gateway_http_error",
             request_id=request_id,
             user_id=user.user_id,
             status_code=exc.response.status_code,
@@ -3527,7 +4166,7 @@ Answer clearly, directly, and concisely.
         raise HTTPException(
             status_code=502,
             detail=(
-                "The local language model "
+                "The selected language model "
                 "returned an error."
             ),
         )
@@ -3535,7 +4174,7 @@ Answer clearly, directly, and concisely.
     except httpx.RequestError as exc:
 
         safe_audit(
-            "ollama_connection_error",
+            "ai_gateway_connection_error",
             request_id=request_id,
             user_id=user.user_id,
             error=str(exc),
@@ -3544,15 +4183,16 @@ Answer clearly, directly, and concisely.
         raise HTTPException(
             status_code=503,
             detail=(
-                "The local language model "
+                "The AI gateway or selected model "
                 "is unavailable."
             ),
         )
 
     except Exception as exc:
+        CHAT_ERRORS.inc()
 
         safe_audit(
-            "ollama_error",
+            "ai_gateway_error",
             request_id=request_id,
             user_id=user.user_id,
             error=str(exc),
@@ -3565,6 +4205,7 @@ Answer clearly, directly, and concisely.
             ),
         )
 
+    
     # ========================================================
     # HALLUCINATION / GROUNDING
     # ========================================================
@@ -3574,7 +4215,7 @@ Answer clearly, directly, and concisely.
         "action": "skip",
     }
 
-    if used_rag or used_web:
+    if used_rag or used_web or used_okf:
 
         try:
 
@@ -3585,6 +4226,7 @@ Answer clearly, directly, and concisely.
                     answer,
                     relevant_retrieved,
                     web_context,
+                    okf_context,
                 )
             )
 
@@ -3596,6 +4238,8 @@ Answer clearly, directly, and concisely.
             )
 
         except Exception as exc:
+
+            CHAT_ERRORS.inc()
 
             print(
                 f"[Hallucination] Check failed: {exc}"
@@ -3625,40 +4269,53 @@ Answer clearly, directly, and concisely.
             reason="no_rag_or_web_reference",
         )
 
+
     # ========================================================
     # GROUNDING RESULT
     # ========================================================
 
-    grounding_action = (
-        hallucination_result.get(
-            "action"
+    grounding_action = hallucination_result.get("action")
+
+    verification_warning = None
+
+    if grounding_action == "block":
+
+        # Explicit grounding failure: block the answer
+        answer = (
+            "I could not verify this answer against "
+            "the available reference material, so I "
+            "will not present it as a verified fact."
         )
-    )
 
-    if grounding_action in {
-        "block",
-        "verification_error",
-    }:
+        print("[Hallucination] Answer BLOCKED")
 
-        if (
+    elif grounding_action == "verification_error":
+
+        # Preserve the original AI-generated answer
+        verification_warning = (
+            "This answer could not be independently verified "
+            "because the verification service was unavailable."
+        )
+
+        print(
+            "[Hallucination] Verification unavailable. "
+            "Preserving generated answer."
+        )
+
+        safe_audit(
+            "hallucination_verification_unavailable",
+            request_id=request_id,
+            user_id=user.user_id,
+            warning=verification_warning,
+        )
+
+    else:
+
+        print(
+            "[Hallucination] Verification completed:",
             grounding_action
-            == "verification_error"
-        ):
+        )
 
-            answer = (
-                "I could not verify the generated answer "
-                "against the available reference material. "
-                "Please try again or provide a more specific "
-                "source document."
-            )
-
-        else:
-
-            answer = (
-                "I could not verify this answer against "
-                "the available reference material, so I "
-                "will not present it as a verified fact."
-            )
 
     # ========================================================
     # OUTPUT GUARD
@@ -3683,6 +4340,7 @@ Answer clearly, directly, and concisely.
         )
 
     except Exception as exc:
+        CHAT_ERRORS.inc()
 
         safe_audit(
             "chat_output_guard_error",
@@ -3765,6 +4423,7 @@ Answer clearly, directly, and concisely.
         username=user.username,
         role=user.role,
         used_rag=used_rag,
+        used_okf=used_okf,
         used_web=used_web,
         images_sent=image_count,
         source_count=len(
@@ -3784,6 +4443,11 @@ Answer clearly, directly, and concisely.
         ),
     )
 
+    # Prometheus response-time metric
+    CHAT_RESPONSE_TIME.observe(
+        time.perf_counter() - chat_started
+    )
+
     # ========================================================
     # RESPONSE
     # ========================================================
@@ -3792,6 +4456,7 @@ Answer clearly, directly, and concisely.
         "answer": answer,
         "sources": sources,
         "used_rag": used_rag,
+        "used_okf": used_okf,
         "used_web": used_web,
         "images_sent": image_count,
     }
@@ -4492,6 +5157,13 @@ async def serve_frontend():
         STATIC_DIR / "index.html"
     )
 
+@app.get("/metrics")
+async def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )
+
 
 # ============================================================
 # START SERVER
@@ -4527,7 +5199,7 @@ if __name__ == "__main__":
         "server_starting",
         host="0.0.0.0",
         port=8000,
-        model=OLLAMA_MODEL,
+        model=DEFAULT_CHAT_MODEL,
     )
 
     uvicorn.run(
